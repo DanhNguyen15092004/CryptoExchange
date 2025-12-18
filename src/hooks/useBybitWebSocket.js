@@ -1,313 +1,239 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useEffect, useCallback } from 'react'
+import { useWebSocketRefs, useWebSocketState } from './useWebSocketState'
+import { useBatchProcessor } from './useBatchProcessor'
+import {
+  RECONNECT_DELAYS,
+  MAX_RECONNECT_ATTEMPTS,
+  PING_INTERVAL,
+  TIMEFRAME_INTERVALS,
+  processKlineData,
+  createWebSocketMessage,
+  calculatePriceChange,
+  calculateVolume,
+} from './websocketHelpers'
 
-// Bybit WebSocket hook for real-time candlestick data
 export const useBybitWebSocket = (symbol, timeframe = '1') => {
-  const [chartData, setChartData] = useState([]);
-  const [currentPrice, setCurrentPrice] = useState(null);
-  const [priceChange24h, setPriceChange24h] = useState(0);
-  const [volume24h, setVolume24h] = useState(0);
-  const [connectionStatus, setConnectionStatus] = useState('disconnected');
-  const [error, setError] = useState(null);
+  const state = useWebSocketState()
+  const refs = useWebSocketRefs()
+  const { updateChartData } = useBatchProcessor(refs, state)
 
-  const wsRef = useRef(null);
-  const reconnectTimeoutRef = useRef(null);
-  const pingIntervalRef = useRef(null);
-  const mountedRef = useRef(true);
-  const initialDataLoadedRef = useRef(false);
-  const currentSubscriptionRef = useRef(null); // Track current subscription
-
-  // Process kline data from Bybit
-  const processKlineData = useCallback((kline) => {
-    return {
-      time: Math.floor(kline.start / 1000), // Convert ms to seconds
-      open: parseFloat(kline.open),
-      high: parseFloat(kline.high),
-      low: parseFloat(kline.low),
-      close: parseFloat(kline.close),
-      volume: parseFloat(kline.volume),
-    };
-  }, []);
-
-  // Update chart data with new candle
-  const updateChartData = useCallback((newCandle) => {
-    setChartData(prevData => {
-      // If no data, start with this candle
-      if (prevData.length === 0) {
-        return [newCandle];
-      }
-
-      const lastCandle = prevData[prevData.length - 1];
-
-      // Update existing candle if same timestamp
-      if (lastCandle.time === newCandle.time) {
-        return [...prevData.slice(0, -1), newCandle];
-      }
-
-      // Add new candle if timestamp is newer
-      if (newCandle.time > lastCandle.time) {
-        const updatedData = [...prevData, newCandle]
-          .sort((a, b) => a.time - b.time)
-          .slice(-200); // Keep last 200 candles
-        return updatedData;
-      }
-
-      // Ignore older candles
-      return prevData;
-    });
-  }, []);
-
-  // Subscribe to a symbol/timeframe
   const subscribe = useCallback((ws, sym, tf) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
 
-    const topic = `kline.${tf}.${sym}`;
+    const topic = `kline.${tf}.${sym}`
+    const { currentSubscriptionRef } = refs
     
-    // Unsubscribe from previous topic if exists
     if (currentSubscriptionRef.current) {
-      const unsubscribeMsg = {
-        op: 'unsubscribe',
-        args: [currentSubscriptionRef.current]
-      };
-      ws.send(JSON.stringify(unsubscribeMsg));
-      console.log(`🔕 Unsubscribed from ${currentSubscriptionRef.current}`);
+      ws.send(createWebSocketMessage('unsubscribe', [currentSubscriptionRef.current]))
+      console.log(`🔕 Unsubscribed from ${currentSubscriptionRef.current}`)
     }
 
-    // Subscribe to new topic
-    const subscribeMsg = {
-      op: 'subscribe',
-      args: [topic]
-    };
-    ws.send(JSON.stringify(subscribeMsg));
-    currentSubscriptionRef.current = topic;
-    console.log(`📊 Subscribed to ${topic}`);
-  }, []);
+    ws.send(createWebSocketMessage('subscribe', [topic]))
+    currentSubscriptionRef.current = topic
+    console.log(`📊 Subscribed to ${topic}`)
+  }, [refs])
 
-  // Connect to Bybit WebSocket (only once)
+  const setupPing = useCallback((ws) => {
+    const { pingIntervalRef, lastMessageTimeRef, mountedRef } = refs
+    
+    if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
+    
+    pingIntervalRef.current = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN && mountedRef.current) {
+        ws.send(createWebSocketMessage('ping'))
+        lastMessageTimeRef.current = Date.now()
+      }
+    }, PING_INTERVAL)
+  }, [refs])
+
+  const handleReconnect = useCallback(() => {
+    const { reconnectAttemptsRef, reconnectTimeoutRef, mountedRef } = refs
+    const { setError, setConnectionStatus } = state
+
+    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      console.error(`❌ Max reconnect attempts reached`)
+      setError(`Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts`)
+      setConnectionStatus('error')
+      return
+    }
+
+    const delayIndex = Math.min(reconnectAttemptsRef.current, RECONNECT_DELAYS.length - 1)
+    const delay = RECONNECT_DELAYS[delayIndex]
+
+    console.log(`🔄 Reconnecting in ${delay}ms (${reconnectAttemptsRef.current + 1}/${MAX_RECONNECT_ATTEMPTS})`)
+
+    reconnectTimeoutRef.current = setTimeout(() => {
+      if (mountedRef.current) {
+        reconnectAttemptsRef.current++
+        connect()
+      }
+    }, delay)
+  }, [refs, state])
+
   const connect = useCallback(() => {
-    if (!mountedRef.current) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      console.log('✅ WebSocket already connected');
-      return;
+    const { wsRef, mountedRef, reconnectAttemptsRef, lastMessageTimeRef, initialDataLoadedRef } = refs
+    const { setConnectionStatus, setError } = state
+
+    if (!mountedRef.current || (wsRef.current?.readyState === WebSocket.OPEN)) {
+      return
     }
 
     try {
-      setConnectionStatus('connecting');
-      setError(null);
+      setConnectionStatus('connecting')
+      setError(null)
 
-      // Bybit public WebSocket endpoint
-      const ws = new WebSocket('wss://stream.bybit.com/v5/public/spot');
-      wsRef.current = ws;
+      const ws = new WebSocket('wss://stream.bybit.com/v5/public/spot')
+      wsRef.current = ws
 
       ws.onopen = () => {
-        if (!mountedRef.current) return;
-        
-        console.log('✅ Connected to Bybit WebSocket');
-        setConnectionStatus('connected');
-
-        // Subscribe to initial symbol/timeframe
-        subscribe(ws, symbol, timeframe);
-
-        // Setup ping/pong to keep connection alive
-        if (pingIntervalRef.current) {
-          clearInterval(pingIntervalRef.current);
-        }
-        pingIntervalRef.current = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ op: 'ping' }));
-          }
-        }, 20000); // Ping every 20 seconds
-      };
+        if (!mountedRef.current) return
+        console.log('✅ Connected to Bybit WebSocket')
+        setConnectionStatus('connected')
+        reconnectAttemptsRef.current = 0
+        subscribe(ws, symbol, timeframe)
+        setupPing(ws)
+      }
 
       ws.onmessage = (event) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current) return
+        lastMessageTimeRef.current = Date.now()
 
         try {
-          const data = JSON.parse(event.data);
+          const data = JSON.parse(event.data)
 
-          // Handle pong response
-          if (data.op === 'pong') {
-            return;
-          }
+          if (data.op === 'pong' || data.op === 'subscribe') return
 
-          // Handle subscription confirmation
-          if (data.op === 'subscribe') {
-            console.log('✅ Subscription confirmed:', data);
-            return;
-          }
-
-          // Handle kline data
-          if (data.topic && data.topic.startsWith('kline') && data.data) {
-            const klines = Array.isArray(data.data) ? data.data : [data.data];
-
+          if (data.topic?.startsWith('kline') && data.data) {
+            const klines = Array.isArray(data.data) ? data.data : [data.data]
             klines.forEach(kline => {
-              const candle = processKlineData(kline);
-              
-              // Update current price
-              setCurrentPrice(candle.close);
-              
-              // Update chart
-              updateChartData(candle);
-
-              // Calculate 24h change (simplified)
+              updateChartData(processKlineData(kline))
               if (!initialDataLoadedRef.current) {
-                initialDataLoadedRef.current = true;
+                initialDataLoadedRef.current = true
               }
-            });
+            })
           }
-
         } catch (err) {
-          console.error('❌ Error parsing WebSocket message:', err);
+          console.error('❌ Error parsing message:', err)
         }
-      };
+      }
 
-      ws.onerror = (err) => {
-        console.error('❌ WebSocket error:', err);
-        setError('WebSocket connection error');
-        setConnectionStatus('error');
-      };
+      ws.onerror = () => {
+        console.error('❌ WebSocket error')
+        setError('WebSocket connection error')
+        setConnectionStatus('error')
+      }
 
       ws.onclose = () => {
-        if (!mountedRef.current) return;
-
-        console.log('🔌 WebSocket disconnected');
-        setConnectionStatus('disconnected');
-
-        // Clear ping interval
+        if (!mountedRef.current) return
+        console.log('🔌 WebSocket disconnected')
+        setConnectionStatus('disconnected')
+        
+        const { pingIntervalRef } = refs
         if (pingIntervalRef.current) {
-       ubscribl(pingIntervalRef.current);
-          pingIntervalRef.current = null;
+          clearInterval(pingIntervalRef.current)
+          pingIntervalRef.current = null
         }
-
-        // Attempt to reconnect after 3 seconds
-        if (mountedRef.current) {
-          reconnectTimeoutRef.current = setTimeout(() => {
-            console.log('🔄 Attempting to reconnect...');
-            connect();
-          }, 3000);
-        }
-      };
-
+        
+        if (mountedRef.current) handleReconnect()
+      }
     } catch (err) {
-      console.error('❌ Error connecting to WebSocket:', err);
-      setError(err.message);
-      setConnectionStatus('error');
+      console.error('❌ Error connecting:', err)
+      setError(err.message)
+      setConnectionStatus('error')
     }
-  }, [symbol, timeframe, processKlineData, updateChartData]);
+  }, [symbol, timeframe, refs, state, subscribe, setupPing, handleReconnect, updateChartData])
 
-  // Fetch historical data from Bybit REST API
   const fetchHistoricalData = useCallback(async () => {
+    const { setChartData, setCurrentPrice, setPriceChange24h, setVolume24h } = state
+
     try {
-      const intervals = {
-        '1': 1,
-        '3': 3,
-        '5': 5,
-        '15': 15,
-        '30': 30,
-        '60': 60,
-        '120': 120,
-        '240': 240,
-        'D': 1440,
-      };
+      const interval = TIMEFRAME_INTERVALS[timeframe] || 1
+      const limit = 200
+      const endTime = Date.now()
+      const startTime = endTime - (interval * 60 * 1000 * limit)
+      const url = `https://api.bybit.com/v5/market/kline?category=spot&symbol=${symbol}&interval=${timeframe}&start=${startTime}&end=${endTime}&limit=${limit}`
 
-      const interval = intervals[timeframe] || 1;
-      const limit = 200;
-      const endTime = Date.now();
-      const startTime = endTime - (interval * 60 * 1000 * limit);
+      const response = await fetch(url)
+      const result = await response.json()
 
-      const url = `https://api.bybit.com/v5/market/kline?category=spot&symbol=${symbol}&interval=${timeframe}&start=${startTime}&end=${endTime}&limit=${limit}`;
+      if (result.retCode === 0 && result.result?.list) {
+        const klines = result.result.list
+          .map(k => ({
+            time: Math.floor(parseInt(k[0]) / 1000),
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+          }))
+          .sort((a, b) => a.time - b.time)
 
-      const response = await fetch(url);
-      const result = await response.json();
-
-      if (result.retCode === 0 && result.result && result.result.list) {
-        const klines = result.result.list.map(k => ({
-          time: Math.floor(parseInt(k[0]) / 1000), // timestamp in seconds
-          open: parseFloat(k[1]),
-          high: parseFloat(k[2]),
-          low: parseFloat(k[3]),
-          close: parseFloat(k[4]),
-          volume: parseFloat(k[5]),
-        })).sort((a, b) => a.time - b.time);
-
-        setChartData(klines);
+        setChartData(klines)
         
         if (klines.length > 0) {
-          const latest = klines[klines.length - 1];
-          setCurrentPrice(latest.close);
+          const latest = klines[klines.length - 1]
+          const first = klines[0]
           
-          // Calculate 24h change
-          const first = klines[0];
-          const change = ((latest.close - first.open) / first.open) * 100;
-          setPriceChange24h(change);
-          
-          // Sum volume
-          const totalVolume = klines.reduce((sum, k) => sum + (k.volume * k.close), 0);
-          setVolume24h(totalVolume);
+          setCurrentPrice(latest.close)
+          setPriceChange24h(calculatePriceChange(latest.close, first.open))
+          setVolume24h(calculateVolume(klines))
         }
 
-        console.log(`📊 Loaded ${klines.length} historical candles`);
+        console.log(`📊 Loaded ${klines.length} historical candles`)
       }
     } catch (err) {
-      console.error('❌ Error fetching historical data:', err);
+      console.error('❌ Error fetching historical data:', err)
     }
-  }, [symbol, timeframe]);
+  }, [symbol, timeframe, state])
 
-  // Initialize WebSocket connection once
   useEffect(() => {
-    mountedRef.current = true;
+    const { mountedRef } = refs
+    mountedRef.current = true
+    connect()
 
-    // Connect to WebSocket (only once)
-    connect();
-
-    // Cleanup on unmount
     return () => {
-      mountedRef.current = false;
+      mountedRef.current = false
+      const { wsRef, reconnectTimeoutRef, pingIntervalRef, batchTimeoutRef } = refs
 
       if (wsRef.current) {
-        console.log('🔌 Closing WebSocket connection');
-        wsRef.current.close();
-        wsRef.current = null;
+        console.log('🔌 Closing WebSocket')
+        wsRef.current.close()
+        wsRef.current = null
       }
 
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-
-      if (pingIntervalRef.current) {
-        clearInterval(pingIntervalRef.current);
-        pingIntervalRef.current = null;
-      }
-    };
-  }, [connect]);
-
-  // Handle symbol/timeframe changes (without disconnecting)
-  useEffect(() => {
-    initialDataLoadedRef.current = false;
-
-    // Reset state for new symbol
-    console.log(`🔄 Switching to ${symbol} ${timeframe}`);
-    setChartData([]);
-    setCurrentPrice(null);
-    setPriceChange24h(0);
-    setVolume24h(0);
-
-    // Load historical data
-    fetchHistoricalData();
-
-    // Subscribe to new symbol/timeframe (if WebSocket is ready)
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      subscribe(wsRef.current, symbol, timeframe);
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current)
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
+      if (batchTimeoutRef.current) clearTimeout(batchTimeoutRef.current)
     }
+  }, [connect, refs])
 
-  }, [symbol, timeframe, fetchHistoricalData, subscribe]);
+  useEffect(() => {
+    const { initialDataLoadedRef, wsRef } = refs
+    const { setChartData, setCurrentPrice, setPriceChange24h, setVolume24h } = state
+
+    initialDataLoadedRef.current = false
+    console.log(`🔄 Switching to ${symbol} ${timeframe}`)
+
+    setChartData([])
+    setCurrentPrice(null)
+    setPriceChange24h(0)
+    setVolume24h(0)
+
+    fetchHistoricalData()
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      subscribe(wsRef.current, symbol, timeframe)
+    }
+  }, [symbol, timeframe, fetchHistoricalData, subscribe, refs, state])
 
   return {
-    chartData,
-    currentPrice,
-    priceChange24h,
-    volume24h,
-    connectionStatus,
-    error,
-  };
-};
+    chartData: state.chartData,
+    currentPrice: state.currentPrice,
+    priceChange24h: state.priceChange24h,
+    volume24h: state.volume24h,
+    connectionStatus: state.connectionStatus,
+    error: state.error,
+    reconnectAttempts: refs.reconnectAttemptsRef.current,
+    lastMessageTime: refs.lastMessageTimeRef.current,
+  }
+}
