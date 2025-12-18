@@ -143,11 +143,11 @@ export const useServerWebSocket = (symbol, timeframe = '1') => {
       setConnectionStatus('connecting');
       setError(null);
 
-      // Create SignalR connection với negotiate bình thường
+      // Create SignalR connection - skip negotiate, use WebSocket directly
       const connection = new signalR.HubConnectionBuilder()
-        .withUrl('http://localhost:5000/pricehub', {
-          skipNegotiation: false,
-          transport: signalR.HttpTransportType.WebSockets | signalR.HttpTransportType.LongPolling
+        .withUrl('https://busticket.ink/pricehub', {
+          skipNegotiation: true,  // Skip negotiate step
+          transport: signalR.HttpTransportType.WebSockets  // Force WebSocket only
         })
         .withAutomaticReconnect({
           nextRetryDelayInMilliseconds: retryContext => {
@@ -158,7 +158,7 @@ export const useServerWebSocket = (symbol, timeframe = '1') => {
             return null; // Stop retrying after 1 minute
           }
         })
-        .configureLogging(signalR.LogLevel.Information)
+        .configureLogging(signalR.LogLevel.Debug) // More verbose logging
         .build();
 
       connectionRef.current = connection;
